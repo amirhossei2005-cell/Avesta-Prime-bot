@@ -310,6 +310,33 @@ async function faqList(env, token, user, lang, fid) {
   rows.push([{ text: tr('🔙 بازگشت به منوی اصلی', '🔙 Back to main menu', lang), callback_data: 'sub:root' }]);
   return sendToUser(token, user.id, rows.length > 1 ? tr('💡 موضوع را انتخاب کنید:', '💡 Choose a topic:', lang) : tr('هنوز پرسشی تعریف نشده است.', 'No FAQ entries yet.', lang), { reply_markup: { inline_keyboard: rows } });
 }
+const PRI = { low: ['🟢 کم', '🟢 Low'], normal: ['🟡 عادی', '🟡 Normal'], urgent: ['🔴 فوری', '🔴 Urgent'] };
+const STAT = { open: ['در انتظار پاسخ', 'Waiting for reply'], answered: ['پاسخ داده شد', 'Answered'], closed: ['بسته شد', 'Closed'] };
+export const priLabel = (p, lang) => (PRI[p] || PRI.normal)[lang === 'en' ? 1 : 0];
+export const statLabel = (s, lang) => (STAT[s] || STAT.open)[lang === 'en' ? 1 : 0];
+function priorityMarkup(lang) {
+  return { reply_markup: { inline_keyboard: [Object.keys(PRI).map(p => ({ text: priLabel(p, lang), callback_data: `sup:p:${p}` }))] } };
+}
+function fileOf(msg) {
+  if (msg.photo?.length) return { id: msg.photo[msg.photo.length - 1].file_id, type: 'photo', size: msg.photo[msg.photo.length - 1].file_size };
+  if (msg.document) return { id: msg.document.file_id, type: 'document', size: msg.document.file_size };
+  return null;
+}
+async function supportIncoming(env, token, user, lang, T, msg) {
+  const text = String(msg.text || msg.caption || '').trim(), file = fileOf(msg), chatId = msg.chat.id;
+  if (!text && !file) return sendToUser(token, chatId, tr('لطفاً متن، عکس یا فایل ارسال کنید.', 'Please send text, a photo or a file.', lang));
+  if (file?.size > 10 * 1024 * 1024) return sendToUser(token, chatId, tr('حجم فایل بیشتر از ۱۰ مگابایت است.', 'File is larger than 10 MB.', lang));
+  const r = await ticketAppendUser(env, user, text || (file.type === 'photo' ? '📷' : '📎'), { priority: user.supportPriority, file });
+  if (r.limited) return sendToUser(token, chatId, tr('تعداد پیام‌های بدون پاسخ به حد مجاز رسید؛ لطفاً منتظر پاسخ بمانید.', 'Too many unanswered messages; please wait for a reply.', lang));
+  await sendToUser(token, chatId, T.supportSent + (r.fresh ? '\n\n' + tr(`🆔 اولویت: ${priLabel(r.ticket.priority, lang)}\n⏱ معمولاً در کمتر از ۲۴ ساعت پاسخ می‌دهیم.`, `🆔 Priority: ${priLabel(r.ticket.priority, lang)}\n⏱ We usually reply within 24 hours.`, lang) : ''));
+}
+async function myTicket(env, token, user, lang) {
+  const t = await getTicket(env, user.id);
+  if (!t) return sendToUser(token, user.id, tr('تیکتی ندارید. با /support شروع کنید.', 'No tickets yet. Start with /support.', lang));
+  const st = t.open === false ? 'closed' : (t.status || 'open');
+  const hist = (t.messages || []).slice(-6).map(m => `${m.s === 'u' ? '👤' : '🛠'} ${m.file ? (m.ft === 'photo' ? '📷 ' : '📎 ') : ''}${String(m.t).slice(0, 200)}`).join('\n');
+  return sendToUser(token, user.id, `🎫 ${tr('تیکت من', 'My ticket', lang)}\n📌 ${statLabel(st, lang)} · ${priLabel(t.priority, lang)}\n\n${hist}`);
+}
 
 export async function handleUpdate(env, update) {
   const duplicateKey = Number.isSafeInteger(update.update_id) ? entityKey('update', update.update_id) : null;
@@ -350,10 +377,8 @@ async function onMessage(env, msg, token, settings) {
     if (!cmd && user.flow?.type === 'feedback' && text && enabled(settings, 'broadcast')) {
       await ticketAppendUser(env, user, `[Post ${user.flow.postId}] ${text}`); user.flow = null; await putUser(env, user); return sendToUser(token, chatId, T.supportSent);
     }
-    if (user.supportOpen && !cmd && enabled(settings, 'support')) {
-      if (!text) return sendToUser(token, chatId, tr('لطفاً پیام متنی ارسال کنید.', 'Please send a text message.', lang));
-      await ticketAppendUser(env, user, text); return sendToUser(token, chatId, T.supportSent);
-    }
+       if (user.supportOpen && !cmd && enabled(settings, 'support')) return supportIncoming(env, token, user, lang, T, msg);
+
     if (cmd) {
       switch (cmd) {
         case '/start': {
@@ -385,7 +410,8 @@ async function onMessage(env, msg, token, settings) {
         case '/ping': return sendToUser(token, chatId, T.pong);
         case '/help': return sendToUser(token, chatId, renderTpl(menu.help[lang] || menu.help.fa, user) + '\n\n' + (enabled(settings, 'catalog') ? '/catalog · /search\n' : '') + (enabled(settings, 'shop') ? '/cart · /orders\n' : '') + '/rates · /news\n' + (enabled(settings, 'crm') ? '/ref · /points\n' : '') + (enabled(settings, 'learning') ? '/progress\n' : '') + '/cancel');
         case '/lang': return sendToUser(token, chatId, settings.botLangMode === 'both' ? T.chooseLang : T.singleLang, settings.botLangMode === 'both' ? { reply_markup: langKeyboard() } : {});
-        case '/support': if (enabled(settings, 'support')) { user.supportOpen = true; user.flow = null; await putUser(env, user); return sendToUser(token, chatId, T.supportIntro); } break;
+        case '/support': if (enabled(settings, 'support')) { user.supportOpen = true; user.supportPriority = undefined; user.flow = null; await putUser(env, user); return sendToUser(token, chatId, T.supportIntro + '\n\n' + tr('اولویت را انتخاب کنید (پیش‌فرض عادی):', 'Choose priority (default Normal):', lang), priorityMarkup(lang)); } break;
+        case '/mytickets': case '/ticket': if (enabled(settings, 'support')) return myTicket(env, token, user, lang); break;
         case '/catalog': case '/shop': if (enabled(settings, 'catalog')) return catalog(env, token, user, settings, lang); break;
         case '/cart': if (enabled(settings, 'shop')) return showCart(env, token, user, settings, lang); break;
         case '/orders': if (enabled(settings, 'shop')) return myOrders(env, token, user, lang); break;
@@ -423,6 +449,10 @@ async function handleCallback(env, cb, token, settings) {
   const data = String(cb.data || ''), chatId = cb.message?.chat.id, messageId = cb.message?.message_id;
   const answer = (text = '', alert = false) => tgApi(token, 'answerCallbackQuery', { callback_query_id: cb.id, text, show_alert: alert });
   if (user.banned || !chatId) return answer();
+    if (data.startsWith('sup:p:')) {
+    const p = data.slice(6); if (!PRI[p]) return answer();
+    user.supportPriority = p; await putUser(env, user); return answer(priLabel(p, lang));
+  }
   if (data.startsWith('chan:check:') && data.slice(11) !== String(user.id)) return answer(tr('این دکمه برای شما نیست.', 'This button belongs to another user.', lang), true);
   // Admin controls run before the membership gate: the administrator must always
   // be able to approve/reject relay publishing and manage the bot from Telegram.
@@ -491,7 +521,7 @@ async function handleCallback(env, cb, token, settings) {
     // "menu" module, so they keep working for every bot type/purpose.
     if (data.startsWith('sub:')) { await showPage(token, chatId, messageId, menu, data.slice(4), lang, settings, user); return answer(); }
     if (data.startsWith('txt:')) { const [, src, r, c] = data.split(':'); const rows = src === 'root' ? rootInlineRows(menu, settings, lang, user) : menu.submenus?.[src]?.buttons || []; const btn = rows[+r]?.[+c]; return answer(btn?.type === 'text' ? String(btn.value).slice(0, 200) : '…', true); }
-    if (data === 'support:open' && enabled(settings, 'support')) { user.supportOpen = true; user.flow = null; await putUser(env, user); await sendToUser(token, chatId, T.supportIntro); return answer(); }
+    if (data === 'support:open' && enabled(settings, 'support')) { user.supportOpen = true; user.supportPriority = undefined; user.flow = null; await putUser(env, user); await sendToUser(token, chatId, T.supportIntro + '\n\n' + tr('اولویت را انتخاب کنید (پیش‌فرض عادی):', 'Choose priority (default Normal):', lang), priorityMarkup(lang)); return answer(); }
   } catch (e) { return answer(data.startsWith('vpn:') ? serviceError(e.message, lang) : checkoutError(e.message, lang), true); }
   return answer(tr('این بخش در نوع فعلی ربات فعال نیست.', 'This feature is disabled for this bot type.', lang), true);
 }

@@ -329,24 +329,50 @@ async function upsertTicketIndex(env, ticket, { setRead = false, unreadDelta = 0
     ? String(ticket.messages[ticket.messages.length - 1].t).slice(0, 80)
     : item.last;
   item.open = ticket.open !== false;
+    item.status = ticket.open === false ? 'closed' : (ticket.status || 'open');
+  item.priority = ticket.priority || 'normal';
   item.updatedAt = Date.now();
   if (setRead) item.unread = 0;
   else item.unread = Math.max(0, (item.unread || 0) + unreadDelta);
-  arr.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+  const pr = { urgent: 0, normal: 1, low: 2 };
+  arr.sort((a, b) => ((a.open === false) - (b.open === false)) || ((pr[a.priority] ?? 1) - (pr[b.priority] ?? 1)) || (b.updatedAt || 0) - (a.updatedAt || 0));
   await putJson(env, K.TICKETS_INDEX, arr.slice(0, 100));
 }
 
-export async function ticketAppendUser(env, user, text) {
+export const TICKET_PRIORITIES = ['low', 'normal', 'urgent'];
+export const MAX_USER_MSGS_PER_TICKET = 30;
+
+export async function ticketAppendUser(env, user, text, opts = {}) {
   let t = await getTicket(env, user.id);
+  const fresh = !t || t.open === false;
   if (!t) {
     t = { userId: String(user.id), userName: user.firstName || String(user.id), open: true, messages: [], createdAt: Date.now() };
   }
-  t.open = true;
+  let pending = 0;
+  for (let i = t.messages.length - 1; i >= 0 && t.messages[i].s === 'u'; i--) pending++;
+  if (!fresh && pending >= MAX_USER_MSGS_PER_TICKET) return { limited: true, ticket: t };
+  t.open = true; t.status = 'open'; t.closedAt = undefined;
+  if (fresh) t.openedAt = Date.now();
+  if (TICKET_PRIORITIES.includes(opts.priority)) t.priority = opts.priority;
+  else if (!t.priority) t.priority = 'normal';
   t.userName = user.firstName || t.userName;
-  t.messages.push({ s: 'u', t: String(text).slice(0, 3000), at: Date.now() });
+  const m = { s: 'u', t: String(text || '').slice(0, 3000), at: Date.now() };
+  if (opts.file) { m.file = opts.file.id; m.ft = opts.file.type; }
+  t.messages.push(m);  t.status = t.open === false ? 'closed' : 'answered';
   await putTicket(env, t);
   await upsertTicketIndex(env, t, { unreadDelta: 1 });
-  return t;
+  return { ticket: t, fresh };
+}
+
+export async function ticketStats(env) {
+  const arr = asArray(await getJson(env, K.TICKETS_INDEX, []));
+  const st = { total: arr.length, open: 0, answered: 0, closed: 0, urgent: 0 };
+  for (const x of arr) {
+    const s = x.open === false ? 'closed' : (x.status || 'open');
+    st[s] = (st[s] || 0) + 1;
+    if (s !== 'closed' && x.priority === 'urgent') st.urgent++;
+  }
+  return st;
 }
 
 export async function ticketAppendAdmin(env, userId, text) {
@@ -371,7 +397,7 @@ export async function markTicketRead(env, userId) {
 export async function closeTicket(env, userId) {
   const t = await getTicket(env, userId);
   if (!t) return null;
-  t.open = false;
+  t.open = false; t.status = 'closed'; t.closedAt = Date.now();
   await putTicket(env, t);
   await upsertTicketIndex(env, t, { setRead: true });
   return t;

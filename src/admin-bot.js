@@ -5,7 +5,7 @@
 import {
   getSettings, saveSettings, getMenu, saveMenu, putUser, getUser, getStats,
   listUsersPage, getRecentBroadcasts, getEngagementLists, getTicketsList,
-  getTicket, markTicketRead, ticketAppendAdmin, closeTicket,
+  getTicket, markTicketRead, ticketAppendAdmin, closeTicket,ticketStats,
 } from './kv.js';
 import { entityKey, allEntities } from './storage.js';
 import { str, int, isChatId, text as tr, assert, PURPOSES, MODULES, enabled, isValidTime, label, byteLength } from './config.js';
@@ -517,24 +517,48 @@ async function engagementScreen(env, token, chatId, lang) {
   return sendToUser(token, chatId, text, { reply_markup: { inline_keyboard: adminRows([[{ text: '🔄 ' + tr('به‌روزرسانی', 'Refresh', lang), callback_data: 'adm:engagement' }]], lang) } });
 }
 
-async function supportScreen(env, token, chatId, lang, messageId = null) {
-  const tickets = await getTicketsList(env);
-  const rows = tickets.slice(0, 12).map(t => [{ text: `${t.unread ? '🔴' : '💬'} ${String(t.name || t.id).slice(0, 24)} · ${t.unread || 0}`, callback_data: `adm:ticket:${t.id}` }]);
-  rows.push([{ text: '🔄 ' + tr('به‌روزرسانی', 'Refresh', lang), callback_data: 'adm:support' }]);
-  const text = `💬 <b>${tr('صندوق پشتیبانی', 'Support inbox', lang)}</b>\n\n${tr('یک گفت‌وگو را برای پاسخ یا بستن انتخاب کنید.', 'Choose a conversation to reply or close.', lang)}`;
+const esc = (v) => String(v).split('&').join('&amp;').split('<').join('&lt;').split('>').join('&gt;');
+const PRI_ICON = { urgent: '🔴', normal: '🟡', low: '🟢' };
+const ST_ICON = { open: '🆕', answered: '✅', closed: '🔒' };
+
+async function supportScreen(env, token, chatId, lang, messageId = null, filter = 'all') {
+  const all = await getTicketsList(env);
+  const stOf = (t) => (t.open === false ? 'closed' : (t.status || 'open'));
+  const tickets = all.filter(t => filter === 'all' ? true : filter === 'active' ? stOf(t) !== 'closed' : stOf(t) === filter);
+  const rows = tickets.slice(0, 15).map(t => [{ text: `${PRI_ICON[t.priority] || '🟡'}${ST_ICON[stOf(t)]} ${String(t.name || t.id).slice(0, 22)}${t.unread ? ` · ${t.unread}` : ''}`, callback_data: `adm:ticket:${t.id}` }]);
+  rows.push([
+    { text: tr('همه', 'All', lang), callback_data: 'adm:supf:all' }, { text: '🆕', callback_data: 'adm:supf:open' },
+    { text: '✅', callback_data: 'adm:supf:answered' }, { text: '🔒', callback_data: 'adm:supf:closed' },
+  ]);
+  rows.push([{ text: '📊 ' + tr('آمار', 'Stats', lang), callback_data: 'adm:supstats' }, { text: '🔄 ' + tr('به‌روزرسانی', 'Refresh', lang), callback_data: `adm:supf:${filter}` }]);
+  const text = `💬 <b>${tr('صندوق پشتیبانی', 'Support inbox', lang)}</b>\n\n${tr('اولویت فوری بالاتر نمایش داده می‌شود. یک گفت‌وگو را انتخاب کنید.', 'Urgent tickets are listed first. Choose a conversation.', lang)}`;
   const extra = { reply_markup: { inline_keyboard: adminRows(rows, lang) } };
   if (messageId) { const edited = await tgApi(token, 'editMessageText', { chat_id: chatId, message_id: messageId, text, ...extra }); if (edited.ok) return edited; }
   return sendToUser(token, chatId, text, extra);
+}
+
+async function supportStatsScreen(env, token, chatId, lang) {
+  const s = await ticketStats(env);
+  const text = `📊 <b>${tr('آمار پشتیبانی', 'Support stats', lang)}</b>\n\n${tr('کل', 'Total', lang)}: ${s.total}\n🆕 ${tr('در انتظار پاسخ', 'Waiting', lang)}: ${s.open}\n✅ ${tr('پاسخ داده‌شده', 'Answered', lang)}: ${s.answered}\n🔒 ${tr('بسته', 'Closed', lang)}: ${s.closed}\n🔴 ${tr('فوریِ باز', 'Open urgent', lang)}: ${s.urgent}`;
+  return sendToUser(token, chatId, text, { reply_markup: { inline_keyboard: adminRows([[{ text: '⬅️ ' + tr('صندوق', 'Inbox', lang), callback_data: 'adm:support' }]], lang) } });
 }
 
 async function ticketScreen(env, token, chatId, id, lang) {
   const t = await getTicket(env, id);
   if (!t) return supportScreen(env, token, chatId, lang);
   await markTicketRead(env, id);
-  const excerpt = (t.messages || []).slice(-8).map(m => `${m.s === 'u' ? '👤' : '🛠'} ${String(m.t).slice(0, 300)}`).join('\n\n');
+  const msgs = (t.messages || []).slice(-8);
+  const excerpt = msgs.map(m => `${m.s === 'u' ? '👤' : '🛠'} ${m.file ? (m.ft === 'photo' ? '📷 ' : '📎 ') : ''}${esc(String(m.t).slice(0, 300))}`).join('\n\n');
+  const st = t.open === false ? 'closed' : (t.status || 'open');
   const rows = [[{ text: '✉️ ' + tr('پاسخ', 'Reply', lang), callback_data: `adm:reply:${id}` }, { text: '🔒 ' + tr('بستن', 'Close', lang), callback_data: `adm:close:${id}` }]];
-  return sendToUser(token, chatId, `💬 <b>${t.userName || id}</b>\n🆔 ${id}\n\n${excerpt || '—'}`, { reply_markup: { inline_keyboard: adminRows(rows, lang) } });
+  const head = `💬 <b>${esc(t.userName || id)}</b>\n🆔 ${id}\n${PRI_ICON[t.priority] || '🟡'} ${t.priority || 'normal'} · ${ST_ICON[st]} ${st} · ${(t.messages || []).length} ${tr('پیام', 'msgs', lang)}`;
+  const res = await sendToUser(token, chatId, `${head}\n\n${excerpt || '—'}`, { reply_markup: { inline_keyboard: adminRows(rows, lang) } });
+  for (const m of msgs.filter(x => x.file).slice(-3)) {
+    await tgApi(token, m.ft === 'photo' ? 'sendPhoto' : 'sendDocument', { chat_id: chatId, [m.ft === 'photo' ? 'photo' : 'document']: m.file });
+  }
+  return res;
 }
+
 
 async function ordersScreen(env, token, chatId, lang) {
   const orders = (await allEntities(env, 'order')).sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0)).slice(0, 12);
@@ -797,14 +821,19 @@ export async function adminCallback(env, cb, token, user, settings, lang, { answ
       await answer(t2('saved', lang)); await broadcastScreen(env, token, chatId, lang); return true;
     }
     if (data === 'adm:engagement') { await engagementScreen(env, token, chatId, lang); return true; }
+        if (data.startsWith('adm:supf:')) { await answer(); await supportScreen(env, token, chatId, lang, null, data.slice(9)); return true; }
+    if (data === 'adm:supstats') { await answer(); await supportStatsScreen(env, token, chatId, lang); return true; }
+
     if (data === 'adm:support') { await supportScreen(env, token, chatId, lang); return true; }
     if (data.startsWith('adm:ticket:')) { await ticketScreen(env, token, chatId, data.slice('adm:ticket:'.length), lang); return true; }
     if (data.startsWith('adm:reply:')) {
       const id = data.slice('adm:reply:'.length); await answer(); await promptFlow(env, token, chatId, user, { type: 'adm_ticket_reply', userId: id }, t2('userMessagePrompt', lang), lang); return true;
     }
-    if (data.startsWith('adm:close:')) {
-      await closeTicket(env, data.slice('adm:close:'.length)); await answer(t2('saved', lang)); await supportScreen(env, token, chatId, lang); return true;
+        if (data.startsWith('adm:close:')) {
+      const cid = data.slice('adm:close:'.length); await closeTicket(env, cid); await answer(t2('saved', lang));
+      const cu = await getUser(env, cid); if (cu) await sendToUser(token, cu.id, tr('🔒 تیکت شما بسته شد. برای درخواست جدید /support را بزنید.', '🔒 Your ticket was closed. Send /support to open a new one.', cu.lang || lang)); await supportScreen(env, token, chatId, lang); return true;
     }
+
     if (data === 'adm:orders') { await ordersScreen(env, token, chatId, lang); return true; }
     if (data.startsWith('adm:order:')) { await orderScreen(env, token, chatId, data.slice('adm:order:'.length), lang); return true; }
     if (data.startsWith('adm:orderact:')) {
