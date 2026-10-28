@@ -632,14 +632,11 @@ portal.post("/support", async (c) => {
   assert(enabled(await getSettings(c.env), "support"), "support_disabled");
   const text = str((await body(c)).text, 2000);
   assert(text, "support_message_required");
-   const appended = await ticketAppendUser(
+  const ticket = await ticketAppendUser(
     c.env,
     { id: user.id, firstName: user.firstName },
     text,
   );
-  assert(!appended.limited, "too_many_messages");
-  const ticket = appended.ticket;
-
   ticket.userSeenAt = Date.now();
   await putTicket(c.env, ticket);
   const settings = await serviceSettings(c.env);
